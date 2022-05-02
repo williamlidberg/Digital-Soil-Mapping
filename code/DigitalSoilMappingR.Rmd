@@ -1,0 +1,514 @@
+---
+title: "Digital soil mapping"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r echo = FALSE}
+library(caret)
+library(caretEnsemble)
+library(doParallel) 
+library(cluster)
+library(earth)
+library(xgboost)
+library(nnet)
+library(mlbench)
+library(pROC)
+library(plyr)
+library(dplyr)
+library(klaR)
+library(corrplot)
+library(ggplot2)
+library(ggthemes)
+
+```
+
+#Load training data and raster data
+```{r}
+#setwd("C:/data/lokala_exe/TrainingData/")
+#OriginalDataNumeric<-read.table("C:/data/lokala_exe/TrainingData/tester/nioklasser.txt",  stringsAsFactors=TRUE, header = TRUE, dec = ",")
+OriginalDataNumeric<-read.table("E:/DigitalSoilMapping/nioklasser.txt",  stringsAsFactors=TRUE, header = TRUE, dec = ",")
+OriginalDataNumeric<-na.omit(OriginalDataNumeric)
+OriginalDataNumeric$FID <-NULL
+OriginalDataNumeric$soil<-NULL
+OriginalDataNumeric$POINT_X<-NULL
+OriginalDataNumeric$POINT_Y<-NULL
+OriginalDataNumeric$Process<-NULL
+
+OriginalData<-OriginalDataNumeric
+
+
+colsF<-c("Proesskod", "NMD")
+OriginalData[colsF]<-lapply(OriginalData[colsF], factor)
+str(OriginalData)
+#head(OriginalData)
+
+```
+```{r}
+# Data distribution
+library(ggplot2)
+cols <- c("1"="red","2"="lightblue", "3"="blue", "4"="grey", "5"="yellow", "6"="green", "7"="brown", "8"="yellow", "9"="orange")
+
+g<-ggplot(data=OriginalData, aes(x=Proesskod)) + 
+  geom_bar(aes(fill = Proesskod)) +
+  labs(title = "", x = "", y = "Number of points")
+
+g + theme_bw() + theme(legend.position = "none") + theme(axis.text = element_text(angle = 90),panel.border = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) + scale_fill_manual(values = cols)
+
+```
+The features are better described in the paper mentioned in the beginning but here is a short translation:  
+**Proesskod** = Quartenary deposits 
+Berg = 1
+Morän = 3
+Glaciala finsediment = 5
+Glacifluviala sediment = 6
+Torv = 7
+Postglaciala finsediment = 8
+Postglaciala grovsediment = 9
+
+**CVA** = Circular variance (i.e. one minus the mean resultant length) of aspect for an input digital elevation model (DEM): Grohmann, C. H., Smith, M. J., & Riccomini, C. (2010). Multiscale analysis of topographic surface roughness in the Midland Valley, Scotland. IEEE Transactions on Geoscience and Remote Sensing, 49(4), 1200-1213
+
+**EAS_x** = Elevation above stream with x ha flow initation threshold.: Renno, C. D., Nobre, A. D., Cuartas, L. A., Soares, J. V., Hodnett, M. G., Tomasella, J., & Waterloo, M. J. (2008). HAND, a new terrain descriptor using SRTM-DEM: Mapping terra-firme rainforest environments in Amazonia. Remote Sensing of Environment, 112(9), 3469-3481.
+
+**MaxElevationDeviation** = Maximum deviation in elevation
+
+**DI** = Downslope index: Hjerdt, K.N., McDonnell, J.J., Seibert, J. Rodhe, A. (2004) A new topographic index to quantify downslope controls on local drainage, Water Resources Research, 40, W05602, doi:10.1029/2004WR003130
+
+
+**SDFS**
+
+Lets inspect our data for multicollinearity. In short linear models, neural networks and other models can have poor performance if the predictors are to correlated. Other models, such as classification or
+regression trees, might be resistant to highly correlated predictors, but multicollinearity may
+negatively affect interpretability of the model. First we will plot and inspect the correlations.
+
+```{r}
+#check correlation
+set.seed(42)
+#Remove label
+tempMCL<-OriginalDataNumeric[,-9] 
+#create and plot correlation table
+tempCOR <- cor(tempMCL) 
+corrplot(tempCOR, type = "upper", order = "hclust", 
+         tl.col = "black", tl.srt = 55, tl.cex = .6)
+         
+```
+
+
+
+
+Split data into training and testing data. a common practice is to use 70- 80% of the data as training data and the remaining 20-30 % as testing data. A completly seperate dataset provided by SGU will be used to validated the model.
+
+```{r}
+#To speed things up we will use subset of 10 % of the trainingdata to evalaute different models
+set.seed(42)
+TrainingDataIndex<- createDataPartition(OriginalData$Proesskod, p=0.1, list = FALSE)
+subdata <- OriginalData[ TrainingDataIndex,]
+
+#split the subdata into training and testing data
+TrainingDataIndex<- createDataPartition(subdata$Proesskod, p=0.7, list = FALSE)
+subtraining <- subdata[ TrainingDataIndex,]
+subtesting <- subdata[-TrainingDataIndex,]
+
+
+#split original data for training final model
+TrainingDataIndex<- createDataPartition(OriginalData$Proesskod, p=0.7, list = FALSE)
+training <- OriginalData[ TrainingDataIndex,]
+testing <- OriginalData[-TrainingDataIndex,]
+str(training)
+```
+## Evaluate multiple machine learning models
+
+Multiple models were tested using caret. all models used 5 fold cross validation.
+```{r}
+#Tune control for all models
+tune_control <- caret::trainControl(method = "cv", number = 5, allowParallel = TRUE, verboseIter = FALSE)
+```
+
+```{r}
+#Random Forest
+# Use the expand.grid to specify the search space	
+rfGrid <- expand.grid(.mtry= c(2,5,6,7,8,9,10))
+#set up processor cluster
+UseCores <- detectCores()-1
+cl<- makeCluster(cl)
+registerDoParallel(cl)
+
+RF <- caret::train(Proesskod~., data = subtraining, trControl = tune_control, tuneGrid = rfGrid, method = "rf", verbose = TRUE, metric="Kappa")
+
+stopCluster(cl)
+registerDoSEQ()
+RF
+
+caret::confusionMatrix(
+  data = predict(RF, subtesting),
+  reference = subtesting$Proesskod
+  )
+```
+
+
+```{r}
+#plot result from tune grid to see which hyperparameters that result in optimal preformance.
+tuninggridRF<-ggplot(RF, metric = "Kappa", plotType = "scatter",
+     scales = list(x = list(rot = 90))) + theme_bw() + theme(panel.border = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) 
+plot(tuninggridRF)
+```
+
+```{r}
+#Support vector machine
+library(kernlab)
+
+# Use the expand.grid to specify the search space	
+gridTuning <- expand.grid(sigma = c(.01, .015, 0.2), C = c(0.75, 0.9, 1, 1.1, 1.25))
+
+#set up processor cluster
+UseCores <- detectCores()-1
+cl<- makeCluster(cl)
+registerDoParallel(cl)
+
+svmRadial <- caret::train(Proesskod~., data = subtraining, trControl = tune_control, tuneGrid = gridTuning, method = "svmRadial",preProc = c("center","scale"), verbose = TRUE, metric="Kappa")
+
+stopCluster(cl)
+registerDoSEQ()
+svmRadial
+```
+
+
+```{r}
+#plot result from tune grid to see which hyperparameters that result in optimal preformance.
+tuninggridsvmRadial<-ggplot(svmRadial, metric = "Kappa", plotType = "scatter",
+     scales = list(x = list(rot = 90))) + theme_bw() + theme(panel.border = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) 
+plot(tuninggridsvmRadial)
+```
+
+```{r}
+#test model
+caret::confusionMatrix(
+  data = predict(svmRadial, subtesting),
+  reference = subtesting$Proesskod
+  )
+```
+
+
+```{r}
+#neural network
+require(mlbench)
+require(caret)
+require (nnet)
+
+# Use the expand.grid to specify the search space	
+nnetGrid <-  expand.grid(size = seq(from = 1, to = 10, by = 1),
+                        decay = seq(from = 0.1, to = 0.5, by = 0.1))
+
+#set up processor cluster
+UseCores <- detectCores()-1
+cl<- makeCluster(cl)
+registerDoParallel(cl)
+
+nnet <- caret::train(Proesskod~., data = subtraining, trControl = tune_control, tuneGrid = nnetGrid, method = "nnet", verbose = TRUE, metric="Kappa")
+
+stopCluster(cl)
+registerDoSEQ()
+nnet
+
+caret::confusionMatrix(
+  data = predict(nnet, subtesting),
+  reference = subtesting$Proesskod
+  )
+
+```
+```{r}
+#plot result from tune grid to see which hyperparameters that result in optimal preformance.
+tuninggrid<-ggplot(nnet, metric = "Kappa", plotType = "scatter",
+     scales = list(x = list(rot = 90))) + theme_bw() + theme(panel.border = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) 
+plot(tuninggrid)
+```
+
+```{r}
+#Stochastic Gradient Boosting
+require(mlbench)
+require(caret)
+
+# Use the expand.grid to specify the search space	
+gbmGrid <-  expand.grid(interaction.depth = c(2,4,6,8,10), 
+                        n.trees = c(100,250,500,1000), 
+                        shrinkage = 0.1,
+                        n.minobsinnode = 20)
+
+#set up processor cluster
+UseCores <- detectCores()-1
+cl<- makeCluster(cl)
+registerDoParallel(cl)
+
+gbm <- train(Proesskod ~ ., data = subtraining,
+             method = "gbm",
+             tuneGrid = gbmGrid,
+             trControl = tune_control,
+             verbose = FALSE)
+
+stopCluster(cl)
+registerDoSEQ()
+gbm
+
+#test model
+caret::confusionMatrix(
+  data = predict(gbm, subtesting),
+  reference = subtesting$Proesskod
+  )
+
+#plot result from tune grid to see which hyperparameters that result in optimal preformance.
+tuninggridgbm<-ggplot(gbm, metric = "Kappa", plotType = "scatter",
+     scales = list(x = list(rot = 90))) + theme_bw() + theme(panel.border = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) 
+plot(tuninggridgbm)
+```
+
+
+
+
+```{r}
+#xgbDART
+#Tune grid is used to test multiple different hyperparameters and test different models at the same time. 
+gridTuning = expand.grid(
+  nrounds = c(10,50,100,250,500), 
+  max_depth = c(2,4,6,8), 
+  eta = c(0.3), 
+  gamma = c(0), 
+  colsample_bytree = c(1), 
+  min_child_weight = c(1),
+  rate_drop = c(0),
+  skip_drop = c(0),
+  subsample = c(1)
+)
+
+#This is where we set upp the tuning model using the training data and hyperparameters in the tune grid above.
+xgbDARTTuneModel <- caret::train(Proesskod~., data = subtraining, trControl = tune_control, tuneGrid = gridTuning, method = "xgbDART", verbose = FALSE, metric="Kappa")
+registerDoSEQ()
+xgbDARTTuneModel
+
+#test model
+caret::confusionMatrix(
+  data = predict(xgbDARTTuneModel, subtesting),
+  reference = subtesting$Proesskod
+  )
+```
+
+```{r}
+#plot result from tune grid to see which hyperparameters that result in optimal preformance.
+xgbDARTTuneModeltuninggrid<-ggplot(xgbDARTTuneModel, metric = "Kappa", plotType = "scatter",
+     scales = list(x = list(rot = 90))) + theme_bw() + theme(panel.border = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) 
+plot(xgbDARTTuneModeltuninggrid)
+```
+
+
+```{r}
+#lightgb
+#Tune grid is used to test multiple different hyperparameters and test different models at the same time. 
+gridTuning = expand.grid(
+  nrounds = c(10,50,100,250,500), 
+  max_depth = c(2,4,6,8), 
+  eta = c(0.3), 
+  gamma = c(0), 
+  colsample_bytree = c(1), 
+  min_child_weight = c(1),
+  rate_drop = c(0),
+  skip_drop = c(0),
+  subsample = c(1)
+)
+
+#This is where we set upp the tuning model using the training data and hyperparameters in the tune grid above.
+xgbDARTTuneModel <- caret::train(Proesskod~., data = subtraining, trControl = tune_control, tuneGrid = gridTuning, method = "xgbDART", verbose = FALSE, metric="Kappa")
+registerDoSEQ()
+xgbDARTTuneModel
+
+#test model
+caret::confusionMatrix(
+  data = predict(xgbDARTTuneModel, subtesting),
+  reference = subtesting$Proesskod
+  )
+```
+
+
+
+
+
+## Set up and tune XGBOOST
+
+The learner used is "Extreme gradient boosting with dropout"  or [xgbDART](https://xgboost.readthedocs.io/en/latest/index.html). 
+
+There are a number of settings we can adjust in this model. These settings are refered to as paremters or hyperparameters in machine learning lingo and the best values for these parameters will vary with each dataset. We will therefore use some brute force and try combinations of many parameters using a [tune grid](http://topepo.github.io/caret/model-training-and-tuning.html). This aproach will train many models with different parameters to see what works best. This is a very time consuming process. 
+
+Bellow is a short description of each paramter taken from the xgboost documentation:
+<br/>
+**nrounds:** number of decision trees to build.
+
+**max_depth:** Maximum depth of a tree. Increasing this value will make the model more complex and more likely to overfit. 0 is only accepted in lossguided growing policy when tree_method is set as hist and it indicates no limit on
+<br/>
+
+**depth:** Beware that XGBoost aggressively consumes memory when training a deep tree.
+
+**eta:** Step size shrinkage used in update to prevents overfitting. After each boosting step, we can directly get the weights of new features, and eta shrinks the feature weights to make the boosting process more conservative.
+
+**gamma:** Minimum loss reduction required to make a further partition on a leaf node of the tree. The larger gamma is, the more conservative the algorithm will be
+
+**colsample:** This is a family of parameters for subsampling of columns. bytree is the subsample ratio of columns when constructing each tree. Subsampling occurs once for every tree constructed.
+
+**min_child_weigth:** Minimum sum of instance weight (hessian) needed in a child. If the tree partition step results in a leaf node with the sum of instance weight less than min_child_weight, then the building process will give up further partitioning. In linear regression task, this simply corresponds to minimum number of instances needed to be in each node. The larger min_child_weight is, the more conservative the algorithm will be.
+
+**drop_rate:** Dropout rate (a fraction of previous trees to drop during the dropout).
+
+**skip_drop:** Probability of skipping the dropout procedure during a boosting iteration.
+
+**subsample:** Subsample ratio of the training instances. Setting it to 0.5 means that XGBoost would randomly sample half of the training data prior to growing trees. and this will prevent overfitting. Subsampling will occur once in every boosting iteration.
+
+
+```{r}
+set.seed(42)
+# tune control is the way the model is internaly tested during tuning. "cv" means cross validation and number = 5 means that we will use 5 fold cross validation. Allow parallel means that we will use parallel procesing to speed up the process. 
+tune_control <- caret::trainControl(method = "cv", number = 5, allowParallel = TRUE, verboseIter = TRUE)
+
+#Tune grid is used to test multiple different hyperparameters and test different models at the same time. 
+gridTuning = expand.grid(
+  nrounds = c(10,50,100,250,500), 
+  max_depth = c(4,6), 
+  eta = c(0.3), 
+  gamma = c(0), 
+  colsample_bytree = c(1), 
+  min_child_weight = c(1),
+  rate_drop = c(0),
+  skip_drop = c(0),
+  subsample = c(1)
+)
+
+#This is where we set upp the tuning model using the training data and hyperparameters in the tune grid above.
+xgbDARTTuneModel <- caret::train(Proesskod~., data = training, trControl = tune_control, tuneGrid = gridTuning, method = "xgbDART", verbose = FALSE, metric="Kappa")
+registerDoSEQ()
+```
+
+```{r}
+#plot result from tune grid to see which hyperparameters that result in optimal preformance.
+tuninggrid<-ggplot(xgbDARTTuneModel, metric = "Kappa", plotType = "scatter",
+     scales = list(x = list(rot = 90))) + theme_bw() + theme(panel.border = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) 
+plot(tuninggrid)
+```
+
+We can also print the trained model for more details
+```{r}
+print(xgbDARTTuneModel) #Note that the best combinations of hyperparameters is listed at the bottom.
+```
+
+
+Now it's time to test the model on the test data. Remember that we did not train on this data. The metric we are interested in is the Kappa value: https://en.wikipedia.org/wiki/Cohen%27s_kappa
+
+Kappa values < 0 can be interpeted as indicating no agreement and 0-0.20 as slight, 0.21-0.40 as fair, 0.41-0.60 as moderate, 0.61-0.80 as substantial, and 0.81-1 as almost perfect agreement: Landis, J.R.; Koch, G.G. (1977). "The measurement of observer agreement for categorical data". Biometrics. 33 (1): 159-174. doi:10.2307/2529310.
+
+```{r}
+#test model
+caret::confusionMatrix(
+  data = predict(xgbDARTTuneModel, testing),
+  reference = testing$Proesskod
+  )
+```
+
+
+Some features are more important than others and the least important ones can potentailly be removed in order to save time and storage space. Remove them and retrain the model to see how it affects the preformance.
+
+```{r}
+#Variable importance
+ggplot(varImp(xgbDARTTuneModel)) +
+  theme_bw() + theme(panel.border = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black"))
+```
+
+
+When you have decided on which features to use and tuned the model with grid tunning it's time to set up the final model.
+This model will use the hyperparameters from the grid tuning but we will use all avalible data to train the model.
+When repporting the accuracy of the model you can refer back to the accuracy obtained when the model was trained on the training data and tested on the test data.
+
+```{r}
+set.seed(42)
+
+control <- caret::trainControl(method = "cv", number = 10, verboseIter = FALSE)
+
+#The vales in the tune grid was seleted with a grid search aproach on the trainingdataset. These are the best values.
+FinalParameters = expand.grid(
+  nrounds = c(100), 
+  max_depth = c(4), 
+  eta = c(0.3), 
+  gamma = c(0), 
+  colsample_bytree = c(1), 
+  min_child_weight = c(1),
+  rate_drop = c(1),
+  skip_drop = c(0),
+  subsample = c(0.5)
+)
+
+#Train model using all data. This will take a while.
+xgbDARTFinalmodel <- caret::train(Moisture~., data = OriginalDataNoCorr, trControl = control, tuneGrid = FinalParameters, method = "xgbDART", verbose = FALSE, metric="Kappa")
+
+```
+
+## Implement the final model in production
+
+Now it's time to put the model into production and predict quartenary deposits on multiband rasters instead of a dataframe. The prediction will be done in parallel where each thread will be used to predict a separate raster. The multiband rasters was created using the arcgis pro tool "Composite bands". see pythonscripts "Master_multithread_CompositeBands.py and Slave_CompositeBands.py" 
+
+```{r echo=TRUE, warning=FALSE, error=FALSE, message=FALSE}
+library(doParallel)
+library(cluster)
+#Define how many cores you want to use. R will detect how many threads your machine have. One thread is commonly left out to handle background processes such as the operating system hence -1.
+UseCores <- detectCores() -1
+
+#Register Cluster
+cl  <- makeCluster(UseCores)
+registerDoParallel(cl)
+
+#Path to folder where all multiband rasters are saved. keep in mind that the output is saved in the same folder as the input. Remove them before running the script again.
+
+#path <- "D:/WilliamLidberg/FeatureExtraction/CompositeBands" #All of Sweden
+path <- "D:/WilliamLidberg/CustomPrediction/CompositeRasters" #Demo areas
+
+stack_list <- list.files(path, pattern=".TIF$", full.names=T) #File ending is case sensetive ".TIF" and ".tif" is not the same.
+
+ptm <- proc.time()
+#Use foreach loop and %dopar% command
+foreach(i=1:length(stack_list)) %dopar% {
+  library(raster)
+  library(caret)
+
+  img  <- stack(stack_list[i])
+  #Set names of each band in the multiband raster. It's important that these are the same as in the training data.
+  #Note that the order of bands sould b the same as the raster composites. see pythonscripts.
+  names(img)[1]<-paste("DEM")
+  names(img)[2]<-paste("EAS1ha")
+  names(img)[3]<-paste("EAS10ha")
+  names(img)[4]<-paste("DI2m")
+  names(img)[5]<-paste("MED")
+  names(img)[6]<-paste("CVA")
+  names(img)[7]<-paste("SDFS")
+  names(img)[8]<-paste("DFME")
+  names(img)[9]<-paste("Rugged")
+  names(img)[10]<-paste("NMD")
+  names(img)[11]<-paste("Soil")
+  names(img)[12]<-paste("HKDepth")
+  names(img)[13]<-paste("SoilDepth")
+  names(img)[14]<-paste("LandAge")
+
+
+  
+  #Predict MLWAM
+  outnamesoil <- sub(pattern     = ".TIF",
+                 replacement = "_soil.tif", 
+                 x           = stack_list[i])
+  map  <- predict(img, xgbDARTFinalmodel, na.rm=TRUE, overwrite = TRUE)
+  writeRaster(map, filename  = outnamesoil, overwrite = TRUE)
+
+ 
+}
+
+#end cluster. make sure to run these two rows even when the script fails to make sure that the cluster is shut down.
+stopCluster(cl)
+registerDoSEQ()
+proc.time() - ptm
+```
+
+

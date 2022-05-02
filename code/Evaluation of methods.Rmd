@@ -1,0 +1,282 @@
+---
+title: "Digital soil mapping"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r echo = FALSE}
+library(caret)
+library(caretEnsemble)
+library(doParallel) 
+library(cluster)
+library(earth)
+library(xgboost)
+library(nnet)
+library(mlbench)
+library(pROC)
+library(plyr)
+library(dplyr)
+library(klaR)
+library(corrplot)
+library(ggplot2)
+library(ggthemes)
+
+```
+
+#Load training data and raster data
+```{r}
+OriginalDataNumeric<-read.table("C:/data/lokala_exe/TrainingData/TrainingData.txt",  stringsAsFactors=TRUE, header = TRUE, dec = ",")
+OriginalDataNumeric<-na.omit(OriginalDataNumeric)
+OriginalDataNumeric$FID <-NULL
+OriginalDataNumeric$soil<-NULL
+OriginalDataNumeric$POINT_X<-NULL
+OriginalDataNumeric$POINT_Y<-NULL
+OriginalDataNumeric$Process<-NULL
+OriginalData<-OriginalDataNumeric
+
+
+colsF<-c("Proesskod", "NMD")
+OriginalData[colsF]<-lapply(OriginalData[colsF], factor)
+str(OriginalData)
+#head(OriginalData)
+
+```
+```{r}
+# Data distribution
+library(ggplot2)
+cols <- c("1"="red","2"="lightblue", "3"="blue", "4"="grey", "5"="yellow", "6"="green", "7"="brown", "8"="yellow", "9"="orange")
+
+g<-ggplot(data=OriginalData, aes(x=Proesskod)) + 
+  geom_bar(aes(fill = Proesskod)) +
+  labs(title = "", x = "", y = "Number of points")
+
+g + theme_bw() + theme(legend.position = "none") + theme(axis.text = element_text(angle = 90),panel.border = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) + scale_fill_manual(values = cols)
+
+```
+The features are better described in the paper mentioned in the beginning but here is a short translation:  
+**Proesskod** = Quartenary deposits 
+Berg = 1
+Morän = 3
+Glaciala finsediment = 5
+Glacifluviala sediment = 6
+Torv = 7
+Postglaciala finsediment = 8
+Postglaciala grovsediment = 9
+
+
+
+Lets inspect our data for multicollinearity. In short linear models, neural networks and other models can have poor performance if the predictors are to correlated. Other models, such as classification or
+regression trees, might be resistant to highly correlated predictors, but multicollinearity may
+negatively affect interpretability of the model. First we will plot and inspect the correlations.
+
+```{r}
+#check correlation
+set.seed(42)
+#Remove label
+tempMCL<-OriginalDataNumeric[,-9] 
+#create and plot correlation table
+tempCOR <- cor(tempMCL) 
+corrplot(tempCOR, type = "upper", order = "hclust", 
+         tl.col = "black", tl.srt = 55, tl.cex = .6)
+         
+```
+
+
+
+
+Split data into training and testing data. a common practice is to use 70- 80% of the data as training data and the remaining 20-30 % as testing data. A completly seperate dataset provided by SGU will be used to validated the model.
+
+```{r}
+#To speed things up we will use subset of 50 % of the trainingdata to evalaute different models
+set.seed(42)
+TrainingDataIndex<- createDataPartition(OriginalData$Proesskod, p=0.5, list = FALSE)
+subdata <- OriginalData[ TrainingDataIndex,]
+
+#split the subdata into training and testing data
+TrainingDataIndex<- createDataPartition(subdata$Proesskod, p=0.7, list = FALSE)
+subtraining <- subdata[ TrainingDataIndex,]
+subtesting <- subdata[-TrainingDataIndex,]
+```
+## Evaluate multiple machine learning models
+
+Multiple models were tested using caret. all models used 5 fold cross validation.
+```{r}
+#Tune control for all models
+tune_control <- caret::trainControl(method = "cv", number = 5, allowParallel = TRUE, verboseIter = FALSE)
+```
+
+```{r}
+#Random Forest
+# Use the expand.grid to specify the search space	
+rfGrid <- expand.grid(.mtry= c(2,5,6,7,8,9,10,15))
+#set up processor cluster
+UseCores <- detectCores()-1
+cl<- makeCluster(cl)
+registerDoParallel(cl)
+
+RF <- caret::train(Proesskod~., data = subtraining, trControl = tune_control, tuneGrid = rfGrid, method = "rf", verbose = TRUE, metric="Kappa")
+
+stopCluster(cl)
+registerDoSEQ()
+RF
+
+caret::confusionMatrix(
+  data = predict(RF, subtesting),
+  reference = subtesting$Proesskod
+  )
+```
+
+
+```{r}
+#plot result from tune grid to see which hyperparameters that result in optimal preformance.
+tuninggridRF<-ggplot(RF, metric = "Kappa", plotType = "scatter",
+     scales = list(x = list(rot = 90))) + theme_bw() + theme(panel.border = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) 
+plot(tuninggridRF)
+```
+
+```{r}
+#Support vector machine
+library(kernlab)
+
+# Use the expand.grid to specify the search space	
+gridTuning <- expand.grid(sigma = c(.01, .015, 0.2), C = c(0.75, 0.9, 1, 1.1, 1.25))
+
+#set up processor cluster
+UseCores <- detectCores()-1
+cl<- makeCluster(cl)
+registerDoParallel(cl)
+
+svmRadial <- caret::train(Proesskod~., data = subtraining, trControl = tune_control, tuneGrid = gridTuning, method = "svmRadial",preProc = c("center","scale"), verbose = TRUE, metric="Kappa")
+
+stopCluster(cl)
+registerDoSEQ()
+svmRadial
+```
+
+
+```{r}
+#plot result from tune grid to see which hyperparameters that result in optimal preformance.
+tuninggridsvmRadial<-ggplot(svmRadial, metric = "Kappa", plotType = "scatter",
+     scales = list(x = list(rot = 90))) + theme_bw() + theme(panel.border = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) 
+plot(tuninggridsvmRadial)
+```
+
+```{r}
+#test model
+caret::confusionMatrix(
+  data = predict(svmRadial, subtesting),
+  reference = subtesting$Proesskod
+  )
+```
+
+
+```{r}
+#neural network
+require(mlbench)
+require(caret)
+require (nnet)
+
+# Use the expand.grid to specify the search space	
+nnetGrid <-  expand.grid(size = seq(from = 1, to = 10, by = 1),
+                        decay = seq(from = 0.1, to = 0.5, by = 0.1))
+
+#set up processor cluster
+UseCores <- detectCores()-1
+cl<- makeCluster(cl)
+registerDoParallel(cl)
+
+nnet <- caret::train(Proesskod~., data = subtraining, trControl = tune_control, tuneGrid = nnetGrid, method = "nnet", verbose = TRUE, metric="Kappa")
+
+stopCluster(cl)
+registerDoSEQ()
+nnet
+
+caret::confusionMatrix(
+  data = predict(nnet, subtesting),
+  reference = subtesting$Proesskod
+  )
+
+```
+```{r}
+#plot result from tune grid to see which hyperparameters that result in optimal preformance.
+tuninggrid<-ggplot(nnet, metric = "Kappa", plotType = "scatter",
+     scales = list(x = list(rot = 90))) + theme_bw() + theme(panel.border = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) 
+plot(tuninggrid)
+```
+
+```{r}
+#Stochastic Gradient Boosting
+require(mlbench)
+require(caret)
+
+# Use the expand.grid to specify the search space	
+gbmGrid <-  expand.grid(interaction.depth = c(2,4,6,8,10), 
+                        n.trees = c(10, 100,250,500,1000), 
+                        shrinkage = 0.1,
+                        n.minobsinnode = 20)
+
+#set up processor cluster
+UseCores <- detectCores()-1
+cl<- makeCluster(cl)
+registerDoParallel(cl)
+
+gbm<- caret::train(Proesskod~., data = subtraining, trControl = tune_control, tuneGrid = gbmGrid, method = "gbm", metric="Kappa")
+
+stopCluster(cl)
+registerDoSEQ()
+
+
+#test model
+caret::confusionMatrix(
+  data = predict(gbm, subtesting),
+  reference = subtesting$Proesskod
+  )
+
+#plot result from tune grid to see which hyperparameters that result in optimal preformance.
+tuninggridgbm<-ggplot(gbm, metric = "Kappa", plotType = "scatter",
+     scales = list(x = list(rot = 90))) + theme_bw() + theme(panel.border = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) 
+plot(tuninggridgbm)
+```
+
+
+
+
+```{r}
+#xgbDART
+#Tune grid is used to test multiple different hyperparameters and test different models at the same time. 
+gridTuning = expand.grid(
+  nrounds = c(10, 100,250,500,1000), 
+  max_depth = c(2,4,6,8,10), 
+  eta = c(0.3), 
+  gamma = c(0), 
+  colsample_bytree = c(1), 
+  min_child_weight = c(1),
+  rate_drop = c(0),
+  skip_drop = c(0),
+  subsample = c(1)
+)
+
+#This is where we set upp the tuning model using the training data and hyperparameters in the tune grid above.
+xgbDARTTuneModel <- caret::train(Proesskod~., data = subtraining, trControl = tune_control, tuneGrid = gridTuning, method = "xgbDART", verbose = FALSE, metric="Kappa")
+registerDoSEQ()
+xgbDARTTuneModel
+
+#test model
+caret::confusionMatrix(
+  data = predict(xgbDARTTuneModel, subtesting),
+  reference = subtesting$Proesskod
+  )
+```
+
+```{r}
+#plot result from tune grid to see which hyperparameters that result in optimal preformance.
+xgbDARTTuneModeltuninggrid<-ggplot(xgbDARTTuneModel, metric = "Kappa", plotType = "scatter",
+     scales = list(x = list(rot = 90))) + theme_bw() + theme(panel.border = element_blank(), panel.grid.major = element_blank(), panel.grid.minor = element_blank(), axis.line = element_line(colour = "black")) 
+plot(xgbDARTTuneModeltuninggrid)
+```
+
+Extreme gradient boosting had the highest kappa value and will be used for the final prediction. 
+
