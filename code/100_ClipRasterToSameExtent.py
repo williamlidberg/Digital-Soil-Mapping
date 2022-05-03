@@ -1,0 +1,30 @@
+##Clip Raster Dataset by known extent - Left Bottom Right Top
+import os
+import arcpy
+from arcpy import env
+arcpy.env.overwriteOutput = True ## 1
+arcpy.env.workspace = 'C:/data/lokala_exe/DEM/' #use SSD drive as workspace to reduce processing time
+#Use all cores of the machine. 
+arcpy.env.parallelProcessingFactor = '100'
+#Set Local variables
+LIDARSQUARES = 'C:/data/lokala_exe/DEM/' #Save clip files on SSD drive to reduce processing time
+RASTERTOBECLIPPED = 'D:/WilliamLidberg/FeatureExtraction/ElevationAboveStream/EAS1haMosaic/EAS1ha.tif' #change this to the raster that shoud be clipped.
+CLIPPED_RASTERS = 'D:/WilliamLidberg/FeatureExtraction/Completed_Features/EAS1ha/' #path to output folder were clipped rasters will be saved. you need to make this folder yourself.
+
+#Loop to find all rasters in a folder and clip based on their extent
+for file in os.listdir(LIDARSQUARES):
+    if file.endswith('.tif'):
+        #local variables
+        out_raster = CLIPPED_RASTERS + file #The name of the input shapefile will be used to name the output raster
+        in_raster = 'D:/WilliamLidberg/FeatureExtraction/ElevationAboveStream/EAS1haMosaic/EAS1ha.tif' #path to Raster mosaic to be clipped
+        in_template_dataset = LIDARSQUARES + file #use DEM for all other tools
+        #get extent of file to clip raster
+        desc = arcpy.Describe(file)
+        clippextent = str(desc.extent)
+
+
+        try:
+            print('Running for file = ' + file)
+            arcpy.management.Clip(in_raster, clippextent, out_raster, in_template_dataset, "#", "#", "MAINTAIN_EXTENT")
+        except:
+            print("Error, you are doing it wrong!")
